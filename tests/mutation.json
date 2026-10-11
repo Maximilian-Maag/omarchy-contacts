@@ -21,6 +21,7 @@
         "-m",
         "unittest",
         "tests.test_unit_contacts",
+        "tests.test_regression_contacts",
         "tests.test_integration_cli"
       ]
     },

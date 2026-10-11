@@ -159,10 +159,10 @@ def unfold(text):
 
 
 def fold_line(line):
-    """Fold a vCard line at FOLD_WIDTH octets on a space boundary when possible."""
-    raw = line.encode("utf-8")
-    if len(raw) <= FOLD_WIDTH:
-        return line
+    """Fold a vCard line so no physical line exceeds FOLD_WIDTH octets.
+
+    A short line comes back unchanged (it fits in a single piece).
+    """
     pieces, buf = [], b""
     for ch in line:
         enc = ch.encode("utf-8")
@@ -172,7 +172,7 @@ def fold_line(line):
         else:
             buf += enc
     pieces.append(buf.decode("utf-8"))
-    return ("\r\n ".join(pieces))
+    return "\r\n ".join(pieces)
 
 
 def parse_line(line):
@@ -240,7 +240,7 @@ def new_contact(fn="", uid=None):
         add_value(contact, "FN", fn)
         parts = fn.split()
         given = parts[0] if parts else ""
-        family = " ".join(parts[1:]) if len(parts) > 1 else ""
+        family = " ".join(parts[1:])
         add_value(contact, "N", f"{family};{given};;;")
     contact["uid"] = get_value(contact, "UID") or ""
     return contact

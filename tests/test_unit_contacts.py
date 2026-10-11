@@ -63,6 +63,21 @@ class SplitTests(unittest.TestCase):
     def test_split_honours_quotes(self):
         self.assertEqual(ct.split_unescaped('a;"b;c";d', ";"), ["a", '"b;c"', "d"])
 
+    def test_split_trailing_backslash_kept(self):
+        # a backslash as the final character must not index past the end
+        self.assertEqual(ct.split_unescaped("a\\", ";"), ["a\\"])
+
+    def test_split_keeps_escaped_sep_at_end(self):
+        self.assertEqual(ct.split_unescaped("a\\;", ";"), ["a\\;"])
+
+
+class UnescapeBoundaryTests(unittest.TestCase):
+    def test_escape_at_end_is_literal(self):
+        self.assertEqual(ct.unescape_value("a\\"), "a\\")
+
+    def test_last_escape_sequence_processed(self):
+        self.assertEqual(ct.unescape_value("a\\n"), "a\n")
+
 
 class FoldTests(unittest.TestCase):
     def test_unfold_reverses_fold(self):
@@ -81,6 +96,15 @@ class FoldTests(unittest.TestCase):
         self.assertIn("\r\n ", folded)
         for piece in folded.split("\r\n"):
             self.assertLessEqual(len(piece.encode()), 76)
+
+    def test_exactly_75_bytes_is_not_folded(self):
+        line = "N:" + "a" * 73          # 75 bytes
+        self.assertEqual(ct.fold_line(line), line)
+
+    def test_76_bytes_packs_to_75_then_wraps(self):
+        # the first piece fills exactly FOLD_WIDTH, the remainder wraps
+        line = "N:" + "a" * 74          # 76 bytes
+        self.assertEqual(ct.fold_line(line), "N:" + "a" * 73 + "\r\n " + "a")
 
 
 class ParseLineTests(unittest.TestCase):
@@ -249,6 +273,9 @@ class StoreTests(unittest.TestCase):
 
     def test_load_contact_missing(self):
         self.assertIsNone(ct.load_contact("/nonexistent/x.vcf"))
+
+    def test_delete_contact_missing_returns_false(self):
+        self.assertFalse(ct.delete_contact("/nonexistent/nope.vcf"))
 
     def test_list_collections(self):
         with tempfile.TemporaryDirectory() as d:

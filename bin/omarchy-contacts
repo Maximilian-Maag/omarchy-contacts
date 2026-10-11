@@ -1,0 +1,1088 @@
+#!/usr/bin/env python3
+"""omarchy-contacts — a keyboard-driven address book for Omarchy.
+
+A local, vdir-style store of vCards (one ``.vcf`` per contact, the same layout
+``vdirsyncer`` and Nextcloud use) with a curses UI for editing *any* property of
+a contact, and a small CardDAV client that pulls from and pushes to a Nextcloud
+address book.
+
+Everything the UI shows is coloured from the *applied* Omarchy theme
+(``~/.local/state/omarchy/current/theme/colors.toml``, read live), so every theme
+works with no per-theme code.
+
+    omarchy-contacts list [--query Q]     # contacts, one per line
+    omarchy-contacts show <uid|pattern>   # every property of a contact
+    omarchy-contacts set <uid|pattern> PROP VALUE
+    omarchy-contacts unset <uid|pattern> PROP [VALUE]
+    omarchy-contacts add --fn "Ada Lovelace" --email ada@example.org
+    omarchy-contacts rm <uid|pattern>
+    omarchy-contacts import <file.vcf>
+    omarchy-contacts export [<uid|pattern>]
+    omarchy-contacts sync --pull|--push   # CardDAV (needs a configured server)
+    omarchy-contacts collections          # address books / local collections
+    omarchy-contacts theme [--json]       # the applied palette
+    omarchy-contacts tui                  # the keyboard editor
+
+Contact properties are stored verbatim as ``(NAME, params, value)`` triples, so
+any property — standard, structured (N, ADR), or ``X-`` — round-trips untouched.
+"""
+
+import argparse
+import base64
+import json
+import os
+import pathlib
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import xml.etree.ElementTree as ET
+
+PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
+
+DAV_NS = "DAV:"
+CARD_NS = "urn:ietf:params:xml:ns:carddav"
+VERSION_3 = "3.0"
+FOLD_WIDTH = 75
+UNSET = "(not set)"
+
+USER_CONFIG = "omarchy-contacts/contacts.json"
+DATA_SUBDIR = "omarchy-contacts"
+THEME_COLORS = "omarchy/current/theme/colors.toml"
+
+# The property order the detail view and the CLI prefer; unknown properties
+# (incl. X-) are appended after these in the order they appear.
+PREFERRED_ORDER = [
+    "FN", "N", "NICKNAME", "ORG", "TITLE", "ROLE", "EMAIL", "TEL", "ADR",
+    "URL", "IMPP", "BDAY", "ANNIVERSARY", "CATEGORIES", "NOTE", "UID",
+]
+
+
+# ── paths ─────────────────────────────────────────────────────────────────────
+
+def config_home():
+    return pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or pathlib.Path.home() / ".config")
+
+
+def data_home():
+    return pathlib.Path(os.environ.get("XDG_DATA_HOME") or pathlib.Path.home() / ".local/share")
+
+
+def state_home():
+    return pathlib.Path(os.environ.get("XDG_STATE_HOME") or pathlib.Path.home() / ".local/state")
+
+
+def store_root():
+    return data_home() / DATA_SUBDIR
+
+
+# ── vCard: escaping, parsing, serialising ─────────────────────────────────────
+
+# Properties whose value is a ';'-joined list of components (RFC 6350 §6.2/§6.3):
+# the separators are structural and must NOT be backslash-escaped. CATEGORIES is
+# a ','-joined list, so its commas stay bare too.
+STRUCTURED_SEMI = {"N", "ADR", "ORG"}
+BARE_COMMA = {"CATEGORIES"}
+
+
+def escape_value(value, name=""):
+    """Escape a property value for a vCard line (RFC 6350 §3.4)."""
+    upper = name.upper()
+    out = []
+    for ch in str(value):
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == ";" and upper not in STRUCTURED_SEMI:
+            out.append("\\;")
+        elif ch == "," and upper not in BARE_COMMA:
+            out.append("\\,")
+        elif ch in ("\r\n", "\n", "\r"):
+            out.append("\\n")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def unescape_value(value):
+    """The inverse of :func:`escape_value`."""
+    out = []
+    i = 0
+    text = str(value)
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            if nxt in ("n", "N"):
+                out.append("\n")
+            elif nxt == "\\":
+                out.append("\\")
+            elif nxt == ";":
+                out.append(";")
+            elif nxt == ",":
+                out.append(",")
+            else:
+                out.append(nxt)
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def split_unescaped(text, sep):
+    """Split on `sep` at top level, honouring backslash escapes and quotes."""
+    parts, buf, quoted, i = [], [], False, 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            buf.append(ch)
+            buf.append(text[i + 1])
+            i += 2
+            continue
+        if ch == '"':
+            quoted = not quoted
+        if ch == sep and not quoted:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
+def unfold(text):
+    """Join folded lines (continuation lines start with a space or tab)."""
+    return re.sub(r"\r?\n[ \t]", "", text or "")
+
+
+def fold_line(line):
+    """Fold a vCard line at FOLD_WIDTH octets on a space boundary when possible."""
+    raw = line.encode("utf-8")
+    if len(raw) <= FOLD_WIDTH:
+        return line
+    pieces, buf = [], b""
+    for ch in line:
+        enc = ch.encode("utf-8")
+        if len(buf) + len(enc) > FOLD_WIDTH:
+            pieces.append(buf.decode("utf-8"))
+            buf = enc
+        else:
+            buf += enc
+    pieces.append(buf.decode("utf-8"))
+    return ("\r\n ".join(pieces))
+
+
+def parse_line(line):
+    """(name, params, value) from one unfolded content line, or None if blank."""
+    if not line.strip():
+        return None
+    colon = -1
+    quoted = False
+    for idx, ch in enumerate(line):
+        if ch == '"':
+            quoted = not quoted
+        elif ch == ":" and not quoted:
+            colon = idx
+            break
+    if colon < 0:
+        return None
+    head, value = line[:colon], line[colon + 1:]
+    tokens = split_unescaped(head, ";")
+    name = tokens[0].strip()
+    params = {}
+    for token in tokens[1:]:
+        if not token:
+            continue
+        if "=" in token:
+            key, _, raw = token.partition("=")
+            key = key.strip().upper()
+            if raw.startswith('"') and raw.endswith('"'):
+                raw = raw[1:-1]
+            params.setdefault(key, []).extend(split_unescaped(raw, ","))
+        else:
+            params.setdefault(token.strip().upper(), []).append("")
+    return name, params, unescape_value(value)
+
+
+def serialize_property(name, params, value):
+    head = name
+    for key, values in params.items():
+        for raw in values:
+            head += ";" + key
+            if raw:
+                head += "=" + raw
+    return fold_line(head + ":" + escape_value(value, name))
+
+
+def parse_vcard(text):
+    """One contact: ``{"properties": [ {name, params, value}, … ], "uid": str}``."""
+    properties = []
+    for line in unfold(text).splitlines():
+        parsed = parse_line(line)
+        if parsed is None:
+            continue
+        name, params, value = parsed
+        upper = name.upper()
+        if upper in ("BEGIN", "END", "VERSION"):
+            continue
+        properties.append({"name": name, "params": params, "value": value})
+    contact = {"properties": properties}
+    contact["uid"] = get_value(contact, "UID") or ""
+    return contact
+
+
+def new_contact(fn="", uid=None):
+    contact = {"properties": [{"name": "UID", "params": {}, "value": uid or str(uuid.uuid4())}]}
+    if fn:
+        add_value(contact, "FN", fn)
+        parts = fn.split()
+        given = parts[0] if parts else ""
+        family = " ".join(parts[1:]) if len(parts) > 1 else ""
+        add_value(contact, "N", f"{family};{given};;;")
+    contact["uid"] = get_value(contact, "UID") or ""
+    return contact
+
+
+def serialize_vcard(contact, version=VERSION_3):
+    lines = ["BEGIN:VCARD", "VERSION:" + version]
+    ordered = ordered_properties(contact)
+    for prop in ordered:
+        lines.append(serialize_property(prop["name"], prop["params"], prop["value"]))
+    lines.append("END:VCARD")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def ordered_properties(contact):
+    props = contact.get("properties", [])
+    rank = {name: i for i, name in enumerate(PREFERRED_ORDER)}
+    indexed = list(enumerate(props))
+    indexed.sort(key=lambda pair: (rank.get(pair[1]["name"].upper(), len(rank)), pair[0]))
+    return [prop for _, prop in indexed]
+
+
+def matching(contact, name):
+    upper = name.upper()
+    return [p for p in contact.get("properties", []) if p["name"].upper() == upper]
+
+
+def get_value(contact, name, default=None):
+    found = matching(contact, name)
+    return found[0]["value"] if found else default
+
+
+def get_values(contact, name):
+    return [p["value"] for p in matching(contact, name)]
+
+
+def add_value(contact, name, value, params=None):
+    contact.setdefault("properties", []).append(
+        {"name": name, "params": params or {}, "value": value})
+    if name.upper() == "UID":
+        contact["uid"] = value
+
+
+def remove_value(contact, name, value=None):
+    """Drop matching properties; with `value`, only those with that value."""
+    upper = name.upper()
+    kept = []
+    for prop in contact.get("properties", []):
+        if prop["name"].upper() == upper and (value is None or prop["value"] == value):
+            continue
+        kept.append(prop)
+    contact["properties"] = kept
+    return contact
+
+
+def set_value(contact, name, value, params=None):
+    """Replace the first value of `name` (or add it) — one value per property."""
+    existing = matching(contact, name)
+    if existing:
+        existing[0]["value"] = value
+        if params is not None:
+            existing[0]["params"] = params
+        for extra in existing[1:]:
+            contact["properties"].remove(extra)
+    else:
+        add_value(contact, name, value, params)
+    return contact
+
+
+def formatted_name(contact):
+    fn = get_value(contact, "FN")
+    if fn:
+        return fn
+    emails = get_values(contact, "EMAIL")
+    if emails:
+        return emails[0]
+    return contact.get("uid") or "(no name)"
+
+
+def summary(contact):
+    bits = [formatted_name(contact)]
+    emails = get_values(contact, "EMAIL")
+    if emails:
+        bits.append(emails[0])
+    phone = get_values(contact, "TEL")
+    if phone:
+        bits.append(phone[0])
+    return "  ".join(bits)
+
+
+def display_order(contact):
+    """Properties to show in the detail view, with label text per property."""
+    rows = []
+    seen = set()
+    for name in PREFERRED_ORDER:
+        for prop in matching(contact, name):
+            rows.append(prop)
+            seen.add(id(prop))
+    for prop in contact.get("properties", []):
+        if id(prop) not in seen:
+            rows.append(prop)
+    return rows
+
+
+def property_label(prop):
+    params = prop.get("params") or {}
+    types = params.get("TYPE") or []
+    label = prop["name"].upper()
+    if types:
+        label += " (" + ",".join(types) + ")"
+    return label
+
+
+# ── local store (vdir) ────────────────────────────────────────────────────────
+
+def collection_dir(collection, root=None):
+    return (pathlib.Path(root) if root else store_root()) / collection
+
+
+def list_collections(root=None):
+    base = pathlib.Path(root) if root else store_root()
+    if not base.is_dir():
+        return []
+    return sorted(p.name for p in base.iterdir() if p.is_dir())
+
+
+def vcf_files(directory):
+    directory = pathlib.Path(directory)
+    if not directory.is_dir():
+        return []
+    return sorted(directory.glob("*.vcf"))
+
+
+def load_contact(path):
+    try:
+        return parse_vcard(pathlib.Path(path).read_text(errors="replace"))
+    except OSError:
+        return None
+
+
+def save_contact(contact, directory, filename=None):
+    directory = pathlib.Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    name = filename or (contact.get("uid") or str(uuid.uuid4()))
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name) + ".vcf"
+    path = directory / safe
+    path.write_text(serialize_vcard(contact))
+    return path
+
+
+def load_all(directory):
+    contacts = []
+    for path in vcf_files(directory):
+        contact = load_contact(path)
+        if contact is not None:
+            contact["_path"] = path
+            contacts.append(contact)
+    return contacts
+
+
+def delete_contact(path):
+    try:
+        pathlib.Path(path).unlink()
+        return True
+    except OSError:
+        return False
+
+
+def matches(contact, pattern):
+    """Case-insensitive substring match against name/uid/email/phone."""
+    needle = pattern.lower()
+    hay = [formatted_name(contact), contact.get("uid") or ""]
+    hay += get_values(contact, "EMAIL")
+    hay += get_values(contact, "TEL")
+    hay += get_values(contact, "ORG")
+    return any(needle in (h or "").lower() for h in hay)
+
+
+def find_one(directory, pattern):
+    """The single contact matching `pattern`, or None (exact uid wins)."""
+    contacts = load_all(directory)
+    for contact in contacts:
+        if contact.get("uid") == pattern:
+            return contact
+    hits = [c for c in contacts if matches(c, pattern)]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        return None
+    return hits
+
+
+def search(directory, query):
+    if not query:
+        return load_all(directory)
+    return [c for c in load_all(directory) if matches(c, query)]
+
+
+# ── config / theme ────────────────────────────────────────────────────────────
+
+def default_config():
+    return {"default_collection": "personal", "servers": []}
+
+
+def load_config(path=None):
+    cfg = default_config()
+    shipped = PLUGIN_DIR / "config/contacts.json"
+    if shipped.is_file():
+        cfg.update(json.loads(shipped.read_text()))
+    user = pathlib.Path(path) if path else config_home() / USER_CONFIG
+    if user.is_file():
+        cfg.update(json.loads(user.read_text()))
+    return cfg
+
+
+def save_config(config, path=None):
+    user = pathlib.Path(path) if path else config_home() / USER_CONFIG
+    user.parent.mkdir(parents=True, exist_ok=True)
+    user.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+    return user
+
+
+def load_theme(path=None):
+    """{key: '#hex'} from the applied theme's colors.toml, or {} when absent."""
+    p = pathlib.Path(path) if path else state_home() / THEME_COLORS
+    colors = {}
+    if not p.is_file():
+        return colors
+    for line in p.read_text(errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, raw = stripped.partition("=")
+        raw = raw.strip().strip('"').strip("'")
+        if raw.startswith("#"):
+            colors[key.strip()] = raw
+    return colors
+
+
+def theme_color(colors, *keys, fallback=""):
+    for key in keys:
+        if key in colors:
+            return colors[key]
+    return fallback
+
+
+# ── CardDAV ───────────────────────────────────────────────────────────────────
+
+def _ns(tag, space):
+    return "{%s}%s" % (space, tag)
+
+
+def parse_multistatus(xml_text):
+    """[{href, status, props: {name: value}}] from a DAV multistatus body.
+
+    `props` keys are local names (``displayname``, ``getetag``, ``address-data``…)
+    so callers do not have to know the namespace they came from.
+    """
+    out = []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return out
+    for response in root.findall(_ns("response", DAV_NS)):
+        href_el = response.find(_ns("href", DAV_NS))
+        href = (href_el.text or "").strip() if href_el is not None else ""
+        status = ""
+        status_el = response.find(_ns("status", DAV_NS))
+        if status_el is not None and status_el.text:
+            status = status_el.text.strip()
+        props = {}
+        propstat = response.find(_ns("propstat", DAV_NS))
+        if propstat is not None:
+            prop_el = propstat.find(_ns("prop", DAV_NS))
+            if prop_el is not None:
+                for child in prop_el:
+                    local = child.tag.split("}", 1)[-1]
+                    props[local] = (child.text or "").strip()
+        out.append({"href": href, "status": status, "props": props})
+    return out
+
+
+def discover_principal(xml_text):
+    """The current-user-principal href from a PROPFIND body."""
+    for el in _iter_local(xml_text, "current-user-principal"):
+        href = el.find(_ns("href", DAV_NS))
+        if href is not None and href.text:
+            return href.text.strip()
+    return ""
+
+
+def addressbook_home(xml_text):
+    for el in _iter_local(xml_text, "addressbook-home-set"):
+        href = el.find(_ns("href", DAV_NS))
+        if href is not None and href.text:
+            return href.text.strip()
+    return ""
+
+
+def _iter_local(xml_text, local):
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    return [el for el in root.iter() if el.tag.split("}", 1)[-1] == local]
+
+
+def build_addressbook_report(collection_href):
+    return (
+        '<?xml version="1.0" encoding="utf-8" ?>'
+        '<card:addressbook-query xmlns:d="DAV:" xmlns:card="%s">'
+        '<d:prop><d:getetag/><card:address-data/></d:prop>'
+        "</card:addressbook-query>" % CARD_NS
+    )
+
+
+def build_propfind(prop_tags):
+    inner = "".join(prop_tags)
+    return (
+        '<?xml version="1.0" encoding="utf-8" ?>'
+        '<d:propfind xmlns:d="DAV:" xmlns:card="%s"><d:prop>%s</d:prop></d:propfind>'
+        % (CARD_NS, inner)
+    )
+
+
+def basic_auth_header(user, password):
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    return "Basic " + token
+
+
+def http_request(url, method="GET", body=None, headers=None, user=None, password=None,
+                 context=None, timeout=30):
+    """Perform an HTTP request, returning (status, headers_dict, text)."""
+    request = urllib.request.Request(url, data=(body.encode() if body else None), method=method)
+    if user is not None:
+        request.add_header("Authorization", basic_auth_header(user, password or ""))
+    for key, value in (headers or {}).items():
+        request.add_header(key, value)
+    try:
+        with urllib.request.urlopen(request, context=context, timeout=timeout) as resp:
+            return resp.status, dict(resp.headers), resp.read().decode(errors="replace")
+    except urllib.error.HTTPError as err:
+        return err.code, dict(err.headers or {}), err.read().decode(errors="replace") \
+            if err.fp else ""
+
+
+def join_url(base, href):
+    return urllib.parse.urljoin(base if base.endswith("/") else base + "/", href)
+
+
+def parse_vcards(text):
+    """Every VCARD block in a CardDAV address-data payload."""
+    out = []
+    for block in re.findall(r"BEGIN:VCARD.*?END:VCARD", text, re.DOTALL):
+        out.append(parse_vcard(block))
+    return out
+
+
+def discover_addressbooks(base_url, user, password, context=None):
+    """Address books under `base_url`: [{href, name}]."""
+    _, _, body = http_request(base_url, "PROPFIND",
+                              build_propfind(['<d:current-user-principal/>']),
+                              headers={"Depth": "0", "Content-Type": "application/xml"},
+                              user=user, password=password, context=context)
+    principal = discover_principal(body) or base_url
+    principal_url = join_url(base_url, principal)
+    _, _, body = http_request(principal_url, "PROPFIND",
+                              build_propfind(['<card:addressbook-home-set/>']),
+                              headers={"Depth": "0", "Content-Type": "application/xml"},
+                              user=user, password=password, context=context)
+    home = addressbook_home(body) or principal
+    home_url = join_url(base_url, home)
+    _, _, body = http_request(home_url, "PROPFIND",
+                              build_propfind(['<d:displayname/>',
+                                              '<d:resourcetype/>']),
+                              headers={"Depth": "1", "Content-Type": "application/xml"},
+                              user=user, password=password, context=context)
+    books = []
+    for entry in parse_multistatus(body):
+        if not entry["href"] or entry["href"].rstrip("/") == home.strip("/"):
+            continue
+        if entry["href"].endswith(".vcf"):
+            continue
+        books.append({"href": entry["href"],
+                      "name": entry["props"].get("displayname") or entry["href"]})
+    return books
+
+
+def _write_vcards_from_report(directory, body):
+    """Every address-data vCard in a report → a file in `directory`. Returns count."""
+    written = 0
+    for contact in parse_vcards(body):
+        if not contact.get("uid"):
+            continue
+        save_contact(contact, directory)
+        written += 1
+    return written
+
+
+def sync_pull(base_url, collection_href, directory, user, password, context=None):
+    """Download the whole address book into `directory`. Returns the count."""
+    url = join_url(base_url, collection_href)
+    _, _, body = http_request(url, "REPORT", build_addressbook_report(collection_href),
+                              headers={"Depth": "1", "Content-Type": "application/xml"},
+                              user=user, password=password, context=context)
+    return _write_vcards_from_report(directory, body)
+
+
+def sync_push(base_url, collection_href, directory, user, password, context=None):
+    """Upload every local vCard to the address book. Returns the count."""
+    url = join_url(base_url, collection_href)
+    pushed = 0
+    for path in vcf_files(directory):
+        contact = load_contact(path)
+        if contact is None or not contact.get("uid"):
+            continue
+        target = url.rstrip("/") + "/" + path.name
+        status, _, _ = http_request(target, "PUT", serialize_vcard(contact),
+                                    headers={"Content-Type": "text/vcard; charset=utf-8",
+                                             "If-None-Match": "*"},
+                                    user=user, password=password, context=context)
+        if status in (200, 201, 204, 412):
+            pushed += 1
+    return pushed
+
+
+def server_for(config, label=None):
+    servers = config.get("servers") or []
+    if not servers:
+        return None
+    if label:
+        for server in servers:
+            if server.get("name") == label:
+                return server
+    return servers[0]
+
+
+def password_for(server):
+    if not server:
+        return None
+    if server.get("password_env"):
+        return os.environ.get(server["password_env"])
+    if server.get("password_file"):
+        try:
+            return pathlib.Path(server["password_file"]).expanduser().read_text().strip()
+        except OSError:
+            return None
+    return server.get("password")
+
+
+# ── rendering ─────────────────────────────────────────────────────────────────
+
+def detail_lines(contact):
+    """Label/value rows for one contact, ordered."""
+    rows = []
+    for prop in display_order(contact):
+        rows.append((property_label(prop), prop["value"]))
+    return rows
+
+
+def list_lines(contacts):
+    return [summary(contact) for contact in contacts]
+
+
+# ── curses TUI ────────────────────────────────────────────────────────────────
+
+TUI_KEYS = {
+    "j": "down", "k": "up", "g": "top", "G": "bottom",
+    "/": "search", "n": "new", "d": "delete", "e": "edit",
+    "a": "add", "x": "delprop", "s": "save", "q": "quit",
+    "\n": "open", "\r": "open", "KEY_ENTER": "open", "\x1b": "close",
+}
+
+
+def key_action(key):
+    return TUI_KEYS.get(key)
+
+
+def rgb_of(hexcolor, fallback):
+    """(r, g, b) from '#rrggbb', or `fallback` when the value is unusable."""
+    digits = (hexcolor or "").lstrip("#")
+    if len(digits) == 6:
+        try:
+            return tuple(int(digits[i:i + 2], 16) for i in (0, 2, 4))
+        except ValueError:
+            return fallback
+    return fallback
+
+
+def term_attrs(curses_module, colors):
+    """curses attributes derived from the applied theme, with a safe fallback."""
+    attrs = {"fg": curses_module.A_NORMAL, "accent": curses_module.A_BOLD,
+             "bar": curses_module.A_REVERSE}
+    if not curses_module.has_colors():
+        return attrs
+    curses_module.start_color()
+    try:
+        curses_module.use_default_colors()
+    except Exception:
+        pass
+    bg = rgb_of(theme_color(colors, "background", "bg"), (0, 0, 0))
+    fg = rgb_of(theme_color(colors, "foreground", "fg"), (255, 255, 255))
+    accent = rgb_of(theme_color(colors, "accent"), (255, 255, 0))
+    if curses_module.can_change_color():
+        for index, rgb in ((1, bg), (2, fg), (3, accent)):
+            curses_module.init_color(index, *(value * 1000 // 255 for value in rgb))
+        curses_module.init_pair(1, 2, 1)
+        curses_module.init_pair(2, 3, 1)
+        attrs["fg"] = curses_module.color_pair(1)
+        attrs["accent"] = curses_module.color_pair(2) | curses_module.A_BOLD
+        attrs["bar"] = curses_module.color_pair(1) | curses_module.A_REVERSE
+    return attrs
+
+
+def _paint(stdscr, attr, row, col, text):
+    try:
+        stdscr.addstr(row, col, text, attr)
+    except Exception:
+        pass
+
+
+def _prompt(stdscr, attrs, prompt):
+    height, width = stdscr.getmaxyx()
+    _paint(stdscr, attrs["bar"], height - 2, 0, " " * (width - 1))
+    _paint(stdscr, attrs["accent"], height - 2, 0, prompt[:width - 1])
+    result = ""
+    while True:
+        key = stdscr.getkey()
+        if key in ("\n", "\r", "KEY_ENTER"):
+            return result
+        if key == "\x1b":
+            return ""
+        if key in ("\x7f", "\b", "KEY_BACKSPACE"):
+            result = result[:-1]
+        elif len(key) == 1:
+            result += key
+        _paint(stdscr, attrs["fg"], height - 2, len(prompt),
+               result[:width - len(prompt) - 1])
+
+
+FOOTER = " j/k move  Enter open  e edit  a add  x del  n new  / filter  q quit "
+
+
+def run_tui(collection, config, colors):
+    """The keyboard editor. Thin: all branching lives in the tested helpers above."""
+    import curses
+
+    def _wrap(stdscr):
+        curses.curs_set(0)
+        attrs = term_attrs(curses, colors)
+        query = ""
+        selected = 0
+        mode = "list"
+        while True:
+            contacts = search(collection, query)
+            selected = max(0, min(selected, max(0, len(contacts) - 1)))
+            stdscr.erase()
+            height, width = stdscr.getmaxyx()
+            _paint(stdscr, attrs["bar"], 0, 0,
+                   f" Contacts ({len(contacts)})  filter: {query or '-'} ".ljust(width))
+            if mode == "list":
+                for row, contact in enumerate(contacts[:height - 3]):
+                    attr = attrs["accent"] if row == selected else attrs["fg"]
+                    _paint(stdscr, attr, 1 + row, 0, summary(contact)[:width - 1])
+            elif contacts:
+                contact = contacts[selected]
+                _paint(stdscr, attrs["accent"], 1, 0, formatted_name(contact)[:width - 1])
+                for row, (label, value) in enumerate(detail_lines(contact)):
+                    _paint(stdscr, attrs["fg"], 2 + row, 2, f"{label}: {value}"[:width - 3])
+            _paint(stdscr, attrs["bar"], height - 1, 0, FOOTER.ljust(width))
+            stdscr.refresh()
+
+            action = key_action(stdscr.getkey())
+            if action == "quit":
+                return collection
+            if action == "down":
+                selected += 1
+            elif action == "up":
+                selected -= 1
+            elif action == "top":
+                selected = 0
+            elif action == "bottom":
+                selected = len(contacts) - 1
+            elif action == "open":
+                mode = "detail"
+            elif action == "close":
+                mode = "list"
+            elif action == "search":
+                query = _prompt(stdscr, attrs, "filter: ")
+                selected = 0
+            elif action == "new":
+                save_contact(new_contact(), collection)
+            elif action in ("add", "edit", "delprop") and mode == "detail" and contacts:
+                contact = contacts[selected]
+                prop = _prompt(stdscr, attrs, "property: ").strip().upper()
+                if not prop:
+                    continue
+                if action == "delprop":
+                    remove_value(contact, prop)
+                elif action == "add":
+                    add_value(contact, prop, _prompt(stdscr, attrs, f"{prop} = "))
+                else:
+                    set_value(contact, prop, _prompt(stdscr, attrs, f"{prop} = "))
+                save_contact(contact, collection, filename=contact["uid"])
+            elif action == "delete" and contacts:
+                contact = contacts[selected]
+                if contact.get("_path"):
+                    delete_contact(contact["_path"])
+
+    return curses.wrapper(_wrap)
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def resolve_collection(config, override):
+    return override or config.get("default_collection") or "personal"
+
+
+def cmd_list(args, config):
+    directory = collection_dir(resolve_collection(config, args.collection))
+    contacts = search(directory, args.query)
+    if args.json:
+        print(json.dumps([{"uid": c["uid"], "name": formatted_name(c)} for c in contacts],
+                         indent=2))
+    else:
+        for line in list_lines(contacts):
+            print(line)
+    return 0
+
+
+def cmd_show(args, config):
+    directory = collection_dir(resolve_collection(config, args.collection))
+    found = find_one(directory, args.pattern)
+    if found is None:
+        print("no contact matches", args.pattern, file=sys.stderr)
+        return 1
+    if isinstance(found, list):
+        for contact in found:
+            print(summary(contact))
+        return 0
+    print(formatted_name(found))
+    for label, value in detail_lines(found):
+        print(f"  {label}: {value}")
+    return 0
+
+
+def _one_or_error(directory, pattern):
+    found = find_one(directory, pattern)
+    if found is None:
+        print(f"no contact matches {pattern!r}", file=sys.stderr)
+        return None, 1
+    if isinstance(found, list):
+        print(f"{pattern!r} matches {len(found)} contacts; be more specific", file=sys.stderr)
+        return None, 2
+    return found, 0
+
+
+def cmd_set(args, config):
+    directory = collection_dir(resolve_collection(config, args.collection))
+    contact, code = _one_or_error(directory, args.pattern)
+    if contact is None:
+        return code
+    set_value(contact, args.prop.upper(), args.value)
+    save_contact(contact, directory, filename=contact["uid"])
+    return 0
+
+
+def cmd_unset(args, config):
+    directory = collection_dir(resolve_collection(config, args.collection))
+    contact, code = _one_or_error(directory, args.pattern)
+    if contact is None:
+        return code
+    remove_value(contact, args.prop.upper(), args.value)
+    save_contact(contact, directory, filename=contact["uid"])
+    return 0
+
+
+def cmd_add(args, config):
+    directory = collection_dir(resolve_collection(config, args.collection))
+    contact = new_contact(args.fn or "")
+    for value in args.email or []:
+        add_value(contact, "EMAIL", value)
+    for value in args.tel or []:
+        add_value(contact, "TEL", value)
+    if args.org:
+        add_value(contact, "ORG", args.org)
+    save_contact(contact, directory, filename=contact["uid"])
+    print(contact["uid"])
+    return 0
+
+
+def cmd_rm(args, config):
+    directory = collection_dir(resolve_collection(config, args.collection))
+    contact, code = _one_or_error(directory, args.pattern)
+    if contact is None:
+        return code
+    delete_contact(contact["_path"])
+    return 0
+
+
+def cmd_import(args, config):
+    directory = collection_dir(resolve_collection(config, args.collection))
+    text = pathlib.Path(args.file).read_text(errors="replace")
+    count = 0
+    for contact in parse_vcards(text):
+        save_contact(contact, directory)
+        count += 1
+    print(f"imported {count}")
+    return 0
+
+
+def cmd_export(args, config):
+    directory = collection_dir(resolve_collection(config, args.collection))
+    if args.pattern:
+        contact, code = _one_or_error(directory, args.pattern)
+        if contact is None:
+            return code
+        sys.stdout.write(serialize_vcard(contact))
+        return 0
+    for path in vcf_files(directory):
+        sys.stdout.write(path.read_text(errors="replace"))
+    return 0
+
+
+def cmd_collections(args, config):
+    for name in list_collections():
+        directory = collection_dir(name)
+        print(f"{name}  ({len(vcf_files(directory))} contacts)")
+    for server in config.get("servers") or []:
+        print(f"remote: {server.get('name', server.get('url', '?'))}  {server.get('url', '')}")
+    return 0
+
+
+def cmd_theme(args, config):
+    colors = load_theme()
+    if args.json:
+        print(json.dumps(colors, indent=2, sort_keys=True))
+    else:
+        for key in sorted(colors):
+            print(f"{key} {colors[key]}")
+    return 0
+
+
+def cmd_sync(args, config):
+    directory = collection_dir(resolve_collection(config, args.collection))
+    server = server_for(config, args.server)
+    if not server:
+        print("no CardDAV server configured (add one to contacts.json)", file=sys.stderr)
+        return 1
+    password = password_for(server)
+    books = discover_addressbooks(server["url"], server.get("username", ""), password)
+    if not books:
+        print("no address books found", file=sys.stderr)
+        return 1
+    target = books[0]
+    if args.pull:
+        count = sync_pull(server["url"], target["href"], directory,
+                          server.get("username", ""), password)
+        print(f"pulled {count} contacts from {target['name']}")
+    else:
+        count = sync_push(server["url"], target["href"], directory,
+                          server.get("username", ""), password)
+        print(f"pushed {count} contacts to {target['name']}")
+    return 0
+
+
+def cmd_tui(args, config):
+    if not sys.stdout.isatty():
+        print("the TUI needs a terminal", file=sys.stderr)
+        return 1
+    run_tui(collection_dir(resolve_collection(config, args.collection)), config, load_theme())
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="omarchy-contacts", description=__doc__.splitlines()[0])
+    parser.add_argument("--collection", help="collection to act on (default: config)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("list")
+    p.add_argument("--query", "-q")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("show")
+    p.add_argument("pattern")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("set")
+    p.add_argument("pattern")
+    p.add_argument("prop")
+    p.add_argument("value")
+    p.set_defaults(func=cmd_set)
+
+    p = sub.add_parser("unset")
+    p.add_argument("pattern")
+    p.add_argument("prop")
+    p.add_argument("value", nargs="?")
+    p.set_defaults(func=cmd_unset)
+
+    p = sub.add_parser("add")
+    p.add_argument("--fn")
+    p.add_argument("--email", action="append")
+    p.add_argument("--tel", action="append")
+    p.add_argument("--org")
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("rm")
+    p.add_argument("pattern")
+    p.set_defaults(func=cmd_rm)
+
+    p = sub.add_parser("import")
+    p.add_argument("file")
+    p.set_defaults(func=cmd_import)
+
+    p = sub.add_parser("export")
+    p.add_argument("pattern", nargs="?")
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("collections")
+    p.set_defaults(func=cmd_collections)
+
+    p = sub.add_parser("theme")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_theme)
+
+    p = sub.add_parser("sync")
+    p.add_argument("--pull", action="store_true")
+    p.add_argument("--push", action="store_true")
+    p.add_argument("--server")
+    p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("tui")
+    p.set_defaults(func=cmd_tui)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    config = load_config()
+    return args.func(args, config)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

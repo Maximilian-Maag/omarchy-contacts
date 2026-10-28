@@ -146,5 +146,11 @@ class CliIntegrationCase(unittest.TestCase):
         self.assertEqual(json.loads(out)["accent"], "#82FB9C")
 
 
+    def test_theme_names_the_recorded_theme(self):
+        (self.state / "omarchy-contacts").mkdir(parents=True)
+        (self.state / "omarchy-contacts" / "active-theme").write_text("tokyo-night\n")
+        out = self.run_cli("theme", "--json").stdout
+        self.assertEqual(json.loads(out)["name"], "tokyo-night")
+
 if __name__ == "__main__":
     unittest.main()

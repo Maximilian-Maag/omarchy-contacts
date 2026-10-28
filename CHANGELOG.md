@@ -2,6 +2,15 @@
 
 All notable changes to omarchy-contacts are documented here.
 
+## [0.1.2] — 2026-10-28
+
+### Fixed
+- **The theme-set hook stamped `active-theme` into a file nothing read** (#1, second half).
+  The `theme` command now names the applied theme, preferring the hook's recorded value and
+  falling back to matching the applied colours against the installed theme dirs, so the
+  stamp is finally consumed. New unit + integration tests cover the recorded-wins,
+  colour-match and JSON-`name` paths.
+
 ## [0.1.1] — 2026-10-28
 
 ### Fixed

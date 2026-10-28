@@ -2,6 +2,15 @@
 
 All notable changes to omarchy-contacts are documented here.
 
+## [0.1.1] — 2026-10-28
+
+### Fixed
+- **The theme-set hook shipped under the bare basename `theme-set`** (#1), which
+  omarchy-thunderbird / -keepassxc / -qutebrowser also use — `omarchy hook install` copies
+  to the file's basename, so four plugins fought over
+  `~/.config/omarchy/hooks/theme-set.d/theme-set` and only the last installed survived.
+  Renamed to `hooks/contacts-theme-set`.
+
 ## [0.1.0] — 2026-10-11
 
 ### Added

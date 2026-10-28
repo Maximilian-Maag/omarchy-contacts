@@ -26,10 +26,10 @@ else
 fi
 
 # ── 3. Theme-set hook ─────────────────────────────────────────────────────────
-chmod +x "$PLUGIN_DIR/hooks/theme-set"
+chmod +x "$PLUGIN_DIR/hooks/contacts-theme-set"
 if command -v omarchy >/dev/null 2>&1; then
-  omarchy hook install theme-set "$PLUGIN_DIR/hooks/theme-set"
-  echo "  Installed theme-set hook."
+  omarchy hook install theme-set "$PLUGIN_DIR/hooks/contacts-theme-set"
+  echo "  Installed theme-set hook (as contacts-theme-set)."
 fi
 
 # ── 4. Wire OS keybindings into Hyprland ──────────────────────────────────────

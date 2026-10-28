@@ -1,9 +1,9 @@
 #!/bin/bash
-# Shell tests for hooks/theme-set — run hermetically with a throwaway HOME/XDG.
+# Shell tests for hooks/contacts-theme-set — run hermetically with a throwaway HOME/XDG.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-HOOK="$ROOT/hooks/theme-set"
+HOOK="$ROOT/hooks/contacts-theme-set"
 pass=0; fail=0
 ok()   { echo "  ok: $*"; pass=$((pass+1)); }
 bad()  { echo "  FAIL: $*"; fail=$((fail+1)); }

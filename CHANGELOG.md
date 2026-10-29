@@ -2,6 +2,14 @@
 
 All notable changes to omarchy-contacts are documented here.
 
+## [0.1.3] — 2026-10-28
+
+### Fixed
+- **The applied theme name came from a stale hook stamp** (#2). `applied_theme_name()`
+  preferred the theme-set hook's stamp over Omarchy's authoritative
+  `<state>/omarchy/current/theme.name`. Resolution is now: `current/theme.name` → colour
+  match → hook stamp, with tests for the precedence.
+
 ## [0.1.2] — 2026-10-28
 
 ### Fixed

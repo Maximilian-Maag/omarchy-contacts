@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "Maximilian-Maag.contacts",
   "name": "Contacts",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "author": "Maximilian-Maag",
   "license": "MIT",
   "description": "A keyboard-driven address book: a vdir store of vCards with a curses editor for every property, and a CardDAV client that syncs a Nextcloud address book. Themed from the applied Omarchy palette.",

@@ -152,5 +152,17 @@ class CliIntegrationCase(unittest.TestCase):
         out = self.run_cli("theme", "--json").stdout
         self.assertEqual(json.loads(out)["name"], "tokyo-night")
 
+    def test_current_theme_name_beats_a_stale_stamp(self):
+        state = pathlib.Path(self.tmp.name) / "state2"
+        (state / "omarchy" / "current").mkdir(parents=True)
+        (state / "omarchy" / "current" / "theme.name").write_text("yellow-on-black\n")
+        (state / "omarchy-contacts").mkdir(parents=True)
+        (state / "omarchy-contacts" / "active-theme").write_text("tokyo-night\n")   # stale
+        env = {**self.env, "XDG_STATE_HOME": str(state)}
+        r = subprocess.run([sys.executable, str(CLI), "theme", "--json"],
+                           capture_output=True, text=True, env=env, cwd=str(ROOT))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["name"], "yellow-on-black")
+
 if __name__ == "__main__":
     unittest.main()

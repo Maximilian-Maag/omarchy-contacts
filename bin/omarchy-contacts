@@ -199,12 +199,26 @@ def parse_line(line):
         if "=" in token:
             key, _, raw = token.partition("=")
             key = key.strip().upper()
-            if raw.startswith('"') and raw.endswith('"'):
-                raw = raw[1:-1]
-            params.setdefault(key, []).extend(split_unescaped(raw, ","))
+            if raw[:1] == '"' and raw[-1:] == '"':
+                # A quoted value is ONE value; its commas are literal, not separators
+                # (RFC 6350 §3.3), so `TYPE="a,b"` must not fan out into two params.
+                params.setdefault(key, []).append(raw[1:-1])
+            else:
+                params.setdefault(key, []).extend(split_unescaped(raw, ","))
         else:
             params.setdefault(token.strip().upper(), []).append("")
     return name, params, unescape_value(value)
+
+
+def quote_param_value(raw):
+    """Quote a parameter value carrying a delimiter or whitespace (RFC 6350 §3.3).
+
+    Without the quotes, a value like ``a,b`` is re-read as two ``;``-separated
+    params, so the round-trip silently changes meaning.
+    """
+    if any(ch in raw for ch in (",", ";", ":", " ", "\t")):
+        return '"' + raw + '"'
+    return raw
 
 
 def serialize_property(name, params, value):
@@ -213,7 +227,7 @@ def serialize_property(name, params, value):
         for raw in values:
             head += ";" + key
             if raw:
-                head += "=" + raw
+                head += "=" + quote_param_value(raw)
     return fold_line(head + ":" + escape_value(value, name))
 
 

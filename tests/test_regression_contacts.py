@@ -129,6 +129,29 @@ class CliSafetyTests(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
 
 
+class ParamQuotingTests(unittest.TestCase):
+    """Bug pinned (#4): a quoted param value was re-emitted unquoted, so a value
+    containing a comma split into two params on the next parse."""
+
+    def test_quoted_comma_param_survives_import_export(self):
+        text = ('BEGIN:VCARD\r\nVERSION:3.0\r\nFN:X\r\n'
+                'TEL;TYPE="a,b":12345\r\nEND:VCARD\r\n')
+        contact = ct.parse_vcard(text)
+        tel = [p for p in contact["properties"] if p["name"] == "TEL"][0]
+        self.assertEqual(tel["params"]["TYPE"], ["a,b"])            # one value on import
+        reparsed = ct.parse_vcard(ct.serialize_vcard(contact))
+        tel2 = [p for p in reparsed["properties"] if p["name"] == "TEL"][0]
+        self.assertEqual(tel2["params"]["TYPE"], ["a,b"])           # still one after export
+
+    def test_value_needing_quotes_is_quoted(self):
+        self.assertEqual(ct.serialize_property("TEL", {"TYPE": ["a,b"]}, "12345"),
+                         'TEL;TYPE="a,b":12345')
+
+    def test_simple_value_is_not_quoted(self):
+        self.assertEqual(ct.serialize_property("EMAIL", {"TYPE": ["work"]}, "a@x"),
+                         "EMAIL;TYPE=work:a@x")
+
+
 class SyncPushTests(unittest.TestCase):
     """Bug pinned (#3): a create-only PUT was refused with 412 for an existing
     object, yet 412 counted as success, so re-pushing an edited contact never

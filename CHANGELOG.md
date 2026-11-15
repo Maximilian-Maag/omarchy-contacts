@@ -10,6 +10,10 @@ All notable changes to omarchy-contacts are documented here.
   refusal as success, so re-pushing an edited contact left the server stale while
   printing success. A `412` now triggers a real update PUT without the create-only
   header, and only `200`/`201`/`204` count as a push.
+- **Quoted vCard parameter values were re-emitted unquoted** (#4). A value like
+  `TYPE="a,b"` was written back as `TYPE=a;TYPE=b` and split into two parameters on the
+  next parse. `serialize_property` now quotes any value containing `,` `;` `:` or
+  whitespace, and `parse_line` keeps a quoted value as a single value.
 
 ## [0.1.3] — 2026-10-28
 

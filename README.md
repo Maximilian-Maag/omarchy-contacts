@@ -46,6 +46,7 @@ omarchy-contacts export ada > ada.vcf
 omarchy-contacts import backup.vcf
 omarchy-contacts theme --json              # the applied palette
 omarchy-contacts --collection work list    # act on another collection
+omarchy-contacts default work              # persist the default collection
 ```
 
 ### Editing keys (TUI)

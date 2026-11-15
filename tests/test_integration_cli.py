@@ -137,6 +137,15 @@ class CliIntegrationCase(unittest.TestCase):
         self.run_cli("add", "--fn", "CfgDefault")
         self.assertTrue(list(self.collection_dir("work").glob("*.vcf")))
 
+    def test_default_command_shows_and_persists_the_collection(self):
+        self.assertEqual(self.run_cli("default").stdout.strip(), "personal")
+        self.assertEqual(self.run_cli("default", "work").returncode, 0)
+        saved = json.loads((self.cfg / "omarchy-contacts/contacts.json").read_text())
+        self.assertEqual(saved["default_collection"], "work")
+        self.assertEqual(self.run_cli("default").stdout.strip(), "work")
+        self.run_cli("add", "--fn", "ViaDefault")
+        self.assertTrue(list(self.collection_dir("work").glob("*.vcf")))
+
     # ── theme ────────────────────────────────────────────────────────────
     def test_theme_reads_applied_colors(self):
         theme = self.state / "omarchy/current/theme"

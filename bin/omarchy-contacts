@@ -1000,6 +1000,17 @@ def cmd_collections(args, config):
     return 0
 
 
+def cmd_default(args, config):
+    """Show or set ``default_collection``, persisted through ``save_config``."""
+    if not args.name:
+        print(resolve_collection(config, None))
+        return 0
+    config["default_collection"] = args.name
+    save_config(config)
+    print(f"default collection: {args.name}")
+    return 0
+
+
 def omarchy_theme_name():
     """Omarchy's own record of the applied theme, or ``""``.
 
@@ -1149,6 +1160,10 @@ def build_parser():
 
     p = sub.add_parser("collections")
     p.set_defaults(func=cmd_collections)
+
+    p = sub.add_parser("default", help="show or set the default collection")
+    p.add_argument("name", nargs="?")
+    p.set_defaults(func=cmd_default)
 
     p = sub.add_parser("theme")
     p.add_argument("--json", action="store_true")

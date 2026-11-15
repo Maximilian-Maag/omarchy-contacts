@@ -14,6 +14,9 @@ All notable changes to omarchy-contacts are documented here.
   `TYPE="a,b"` was written back as `TYPE=a;TYPE=b` and split into two parameters on the
   next parse. `serialize_property` now quotes any value containing `,` `;` `:` or
   whitespace, and `parse_line` keeps a quoted value as a single value.
+- **`default_collection` was unreachable** (#5). `save_config` had no caller, so the
+  default collection could never be persisted through the tool. Added a
+  `default [name]` command that shows or sets (and saves) `default_collection`.
 
 ## [0.1.3] — 2026-10-28
 

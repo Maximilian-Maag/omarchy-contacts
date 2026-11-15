@@ -403,9 +403,17 @@ def load_contact(path):
 def save_contact(contact, directory, filename=None):
     directory = pathlib.Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    name = filename or (contact.get("uid") or str(uuid.uuid4()))
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name) + ".vcf"
-    path = directory / safe
+    # A contact loaded from disk keeps its own file, even when the file name differs
+    # from its UID (vdirsyncer names files by the DAV href, not the UID). Deriving the
+    # name from `filename or uid` here minted a second <uid>.vcf and left the original
+    # stale — two contacts sharing one UID — so prefer the path it was read from.
+    existing = contact.get("_path")
+    if existing is not None and pathlib.Path(existing).parent == directory:
+        path = pathlib.Path(existing)
+    else:
+        name = filename or (contact.get("uid") or str(uuid.uuid4()))
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", name) + ".vcf"
+        path = directory / safe
     path.write_text(serialize_vcard(contact))
     return path
 

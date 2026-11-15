@@ -240,5 +240,50 @@ class FoldWidthTests(unittest.TestCase):
         self.assertEqual(ct.unfold(ct.fold_line(original)), original)
 
 
+class SaveInPlaceTests(unittest.TestCase):
+    """Bug pinned (#6): save_contact derived the file name from `filename or uid` and
+    never used the loaded contact's _path, so editing a contact whose file name
+    differs from its UID created a duplicate file (and left the original stale).
+    """
+
+    def _store(self, d):
+        (pathlib.Path(d) / "foo.vcf").write_text(
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:bar@example\r\nFN:Old Name\r\n"
+            "END:VCARD\r\n")
+
+    def test_editing_in_place_does_not_duplicate_the_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._store(d)
+            contacts = ct.load_all(d)
+            self.assertEqual(len(contacts), 1)
+            ct.set_value(contacts[0], "FN", "New Name")
+            ct.save_contact(contacts[0], d, filename=contacts[0]["uid"])
+            files = sorted(p.name for p in pathlib.Path(d).glob("*.vcf"))
+            self.assertEqual(files, ["foo.vcf"])                  # no bar_example.vcf
+            self.assertIn("FN:New Name", (pathlib.Path(d) / "foo.vcf").read_text())
+
+    def test_default_command_edits_in_place_via_the_cli(self):
+        with tempfile.TemporaryDirectory() as t:
+            env = {"XDG_DATA_HOME": t + "/data", "XDG_CONFIG_HOME": t + "/cfg",
+                   "PATH": "/usr/bin:/bin"}
+            store = pathlib.Path(t) / "data" / "omarchy-contacts" / "personal"
+            store.mkdir(parents=True)
+            (store / "foo.vcf").write_text(
+                "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:bar@example\r\nFN:Old Name\r\n"
+                "END:VCARD\r\n")
+            proc = subprocess.run([sys.executable, str(CLI), "set", "bar@example",
+                                   "FN", "New Name"], env=env, capture_output=True,
+                                  text=True, cwd=str(ROOT))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            files = sorted(p.name for p in store.glob("*.vcf"))
+            self.assertEqual(files, ["foo.vcf"])
+
+    def test_new_contact_still_uses_the_uid_file_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = ct.new_contact("Ada Lovelace")
+            p = ct.save_contact(c, d, filename=c["uid"])
+            self.assertEqual(p.name, c["uid"] + ".vcf")
+
+
 if __name__ == "__main__":
     unittest.main()

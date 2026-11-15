@@ -2,6 +2,7 @@
 
 import importlib.machinery
 import importlib.util
+import json
 import pathlib
 import subprocess
 import sys
@@ -283,6 +284,43 @@ class SaveInPlaceTests(unittest.TestCase):
             c = ct.new_contact("Ada Lovelace")
             p = ct.save_contact(c, d, filename=c["uid"])
             self.assertEqual(p.name, c["uid"] + ".vcf")
+
+
+class DefaultConfigRegression(unittest.TestCase):
+    """Bug pinned (#7): cmd_default mutated and saved the fully-MERGED config
+    (load_config overlays the shipped config/contacts.json), baking the shipped
+    defaults — servers: [], and any future shipped key — into the user's file so a
+    later shipped-default change was silently overridden.
+    """
+
+    def _env(self, t):
+        return {"XDG_DATA_HOME": t + "/data", "XDG_CONFIG_HOME": t + "/cfg",
+                "PATH": "/usr/bin:/bin"}
+
+    def _run(self, env, *args):
+        return subprocess.run([sys.executable, str(CLI), *args], env=env,
+                              capture_output=True, text=True, cwd=str(ROOT))
+
+    def test_default_persists_only_the_override(self):
+        with tempfile.TemporaryDirectory() as t:
+            env = self._env(t)
+            proc = self._run(env, "default", "work")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            saved = json.loads(
+                (pathlib.Path(t) / "cfg" / "omarchy-contacts" / "contacts.json").read_text())
+            self.assertEqual(saved, {"default_collection": "work"})
+
+    def test_existing_user_keys_are_preserved(self):
+        # a second `default` must not drop keys the user set in their own file
+        with tempfile.TemporaryDirectory() as t:
+            cfgdir = pathlib.Path(t) / "cfg" / "omarchy-contacts"
+            cfgdir.mkdir(parents=True)
+            (cfgdir / "contacts.json").write_text(
+                json.dumps({"default_collection": "personal", "servers": [{"url": "x"}]}))
+            env = self._env(t)
+            self._run(env, "default", "work")
+            saved = json.loads((cfgdir / "contacts.json").read_text())
+            self.assertEqual(saved, {"default_collection": "work", "servers": [{"url": "x"}]})
 
 
 if __name__ == "__main__":

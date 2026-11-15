@@ -483,6 +483,19 @@ def load_config(path=None):
     return cfg
 
 
+def load_user_config(path=None):
+    """Only the user's own overrides — no shipped defaults.
+
+    ``default`` must persist just the key it changes; merging the shipped config in
+    would bake the shipped defaults into the user's file and silently override any
+    future change to config/contacts.json.
+    """
+    user = pathlib.Path(path) if path else config_home() / USER_CONFIG
+    if user.is_file():
+        return json.loads(user.read_text())
+    return {}
+
+
 def save_config(config, path=None):
     user = pathlib.Path(path) if path else config_home() / USER_CONFIG
     user.parent.mkdir(parents=True, exist_ok=True)
@@ -1018,8 +1031,12 @@ def cmd_default(args, config):
     if not args.name:
         print(resolve_collection(config, None))
         return 0
-    config["default_collection"] = args.name
-    save_config(config)
+    # Persist only the user's own overrides: writing the fully-merged config would
+    # freeze the shipped defaults (servers: [], and any future shipped key) into the
+    # user's file and silently override a later shipped-default change.
+    user = load_user_config()
+    user["default_collection"] = args.name
+    save_config(user)
     print(f"default collection: {args.name}")
     return 0
 

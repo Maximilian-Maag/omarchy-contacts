@@ -141,7 +141,7 @@ class CliIntegrationCase(unittest.TestCase):
         self.assertEqual(self.run_cli("default").stdout.strip(), "personal")
         self.assertEqual(self.run_cli("default", "work").returncode, 0)
         saved = json.loads((self.cfg / "omarchy-contacts/contacts.json").read_text())
-        self.assertEqual(saved["default_collection"], "work")
+        self.assertEqual(saved, {"default_collection": "work"})     # only the override
         self.assertEqual(self.run_cli("default").stdout.strip(), "work")
         self.run_cli("add", "--fn", "ViaDefault")
         self.assertTrue(list(self.collection_dir("work").glob("*.vcf")))

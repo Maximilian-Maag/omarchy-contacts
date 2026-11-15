@@ -95,7 +95,7 @@ class FoldTests(unittest.TestCase):
         folded = ct.fold_line("NOTE:" + "x" * 200)
         self.assertIn("\r\n ", folded)
         for piece in folded.split("\r\n"):
-            self.assertLessEqual(len(piece.encode()), 76)
+            self.assertLessEqual(len(piece.encode()), 75)      # physical line, space included
 
     def test_exactly_75_bytes_is_not_folded(self):
         line = "N:" + "a" * 73          # 75 bytes

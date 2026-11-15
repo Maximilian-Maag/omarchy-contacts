@@ -218,5 +218,27 @@ class SyncPushTests(unittest.TestCase):
             d.cleanup()
 
 
+class FoldWidthTests(unittest.TestCase):
+    """Bug pinned (#8): fold_line packed 75 content octets and then prepended a
+    folding space, so a wrapped physical line was 76 octets — one over the RFC
+    5545/6350 75-octet physical-line limit.
+    """
+
+    def test_no_physical_line_exceeds_75_octets(self):
+        folded = ct.fold_line("NOTE:" + "x" * 200)
+        self.assertIn("\r\n ", folded)
+        for piece in folded.split("\r\n"):
+            self.assertLessEqual(len(piece.encode()), 75)
+
+    def test_multibyte_content_stays_within_75_octets(self):
+        # 'é' is two octets; folding must count octets, not characters
+        for piece in ct.fold_line("NOTE:" + "é" * 100).split("\r\n"):
+            self.assertLessEqual(len(piece.encode()), 75)
+
+    def test_folding_is_still_reversible(self):
+        original = "NOTE:" + "x" * 200
+        self.assertEqual(ct.unfold(ct.fold_line(original)), original)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,15 @@
 
 All notable changes to omarchy-contacts are documented here.
 
+## [Unreleased]
+
+### Fixed
+- **CardDAV push lie: an existing contact was never updated** (#3). `sync_push` sent
+  every vCard with `If-None-Match: *` (create-only) and counted the server's `412`
+  refusal as success, so re-pushing an edited contact left the server stale while
+  printing success. A `412` now triggers a real update PUT without the create-only
+  header, and only `200`/`201`/`204` count as a push.
+
 ## [0.1.3] — 2026-10-28
 
 ### Fixed

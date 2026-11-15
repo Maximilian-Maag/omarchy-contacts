@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CLI = ROOT / "bin/omarchy-contacts"
@@ -126,6 +127,72 @@ class CliSafetyTests(unittest.TestCase):
             proc = self._run(env, "set", "nobody", "ORG", "x")
             self.assertEqual(proc.returncode, 1)
             self.assertNotIn("Traceback", proc.stderr)
+
+
+class SyncPushTests(unittest.TestCase):
+    """Bug pinned (#3): a create-only PUT was refused with 412 for an existing
+    object, yet 412 counted as success, so re-pushing an edited contact never
+    updated the server and still reported success."""
+
+    def _contact_dir(self, email):
+        d = tempfile.TemporaryDirectory()
+        c = ct.new_contact("Ada Lovelace")
+        c["uid"] = "ada"
+        ct.add_value(c, "EMAIL", email)
+        ct.save_contact(c, d.name, filename="ada")
+        return d
+
+    def _push(self, directory, server):
+        calls = []
+
+        def fake(url, method="GET", body=None, headers=None, **kw):
+            name = url.rsplit("/", 1)[-1]
+            create_only = (headers or {}).get("If-None-Match") == "*"
+            calls.append((name, create_only))
+            if create_only and name in server:
+                return 412, {}, "precondition failed"
+            existed = name in server
+            server[name] = body
+            return (204 if existed else 201), {}, ""
+
+        with unittest.mock.patch.object(ct, "http_request", side_effect=fake):
+            pushed = ct.sync_push("https://cloud.example.org/remote.php/dav",
+                                  "addressbooks/user/default/", str(directory), "u", "p")
+        return pushed, calls
+
+    def test_new_contact_is_created(self):
+        d = self._contact_dir("ada@example.org")
+        try:
+            server = {}
+            pushed, _ = self._push(d.name, server)
+            self.assertEqual(pushed, 1)
+            self.assertIn("ada@example.org", server["ada.vcf"])
+        finally:
+            d.cleanup()
+
+    def test_existing_contact_is_actually_updated(self):
+        d = self._contact_dir("new@example.org")
+        try:
+            server = {"ada.vcf": "BEGIN:VCARD\r\nEMAIL:old@example.org\r\nEND:VCARD\r\n"}
+            pushed, calls = self._push(d.name, server)
+            self.assertEqual(pushed, 1)                          # counted exactly once
+            self.assertTrue(any(not create for _, create in calls))   # an update PUT ran
+            self.assertIn("new@example.org", server["ada.vcf"])  # body really changed
+            self.assertNotIn("old@example.org", server["ada.vcf"])
+        finally:
+            d.cleanup()
+
+    def test_a_permanent_refusal_is_not_counted(self):
+        d = self._contact_dir("ada@example.org")
+        try:
+            def refuse(url, method="GET", body=None, headers=None, **kw):
+                return 412, {}, ""
+
+            with unittest.mock.patch.object(ct, "http_request", side_effect=refuse):
+                pushed = ct.sync_push("https://h/dav", "ab/", d.name, "u", "p")
+            self.assertEqual(pushed, 0)
+        finally:
+            d.cleanup()
 
 
 if __name__ == "__main__":

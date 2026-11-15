@@ -650,7 +650,12 @@ def sync_pull(base_url, collection_href, directory, user, password, context=None
 
 
 def sync_push(base_url, collection_href, directory, user, password, context=None):
-    """Upload every local vCard to the address book. Returns the count."""
+    """Upload every local vCard to the address book. Returns the count pushed.
+
+    A create-only PUT (``If-None-Match: *``) is refused with 412 when the object
+    already exists; that is not a push, so the same body is re-sent as a plain
+    update PUT. A 412 (or any other refusal) never counts as success.
+    """
     url = join_url(base_url, collection_href)
     pushed = 0
     for path in vcf_files(directory):
@@ -658,11 +663,18 @@ def sync_push(base_url, collection_href, directory, user, password, context=None
         if contact is None or not contact.get("uid"):
             continue
         target = url.rstrip("/") + "/" + path.name
-        status, _, _ = http_request(target, "PUT", serialize_vcard(contact),
+        body = serialize_vcard(contact)
+        status, _, _ = http_request(target, "PUT", body,
                                     headers={"Content-Type": "text/vcard; charset=utf-8",
                                              "If-None-Match": "*"},
                                     user=user, password=password, context=context)
-        if status in (200, 201, 204, 412):
+        if status == 412:
+            # The object exists: the create-only PUT was refused. Re-send without the
+            # header so the existing contact is actually updated.
+            status, _, _ = http_request(target, "PUT", body,
+                                        headers={"Content-Type": "text/vcard; charset=utf-8"},
+                                        user=user, password=password, context=context)
+        if status in (200, 201, 204):
             pushed += 1
     return pushed
 
